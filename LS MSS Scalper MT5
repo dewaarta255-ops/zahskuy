@@ -1,0 +1,565 @@
+
+#property strict
+#property version "1.00"
+#property description "Liquidity Sweep + MSS Scalper with strict risk controls"
+
+#include <Trade/Trade.mqh>
+CTrade trade;
+
+// ===== GENERAL SETTINGS =====
+input ENUM_TIMEFRAMES InpTimeframe = PERIOD_M1;
+input ulong  InpMagic = 26100901;
+input double InpRiskPercent = 0.5;
+input double InpRewardRisk = 2.0;
+input int    InpMaxTradesPerDay = 3;
+input int    InpMaxSpreadPoints = 50;
+input int    InpDeviationPoints = 20;
+
+// ===== STRATEGY SETTINGS =====
+input int InpSweepLookback = 10;
+input int InpMaxSweepAge = 4;
+input int InpMSSLookback = 5;
+input int InpFastEMA = 50;
+input int InpSlowEMA = 200;
+input int InpSLBufferPoints = 30;
+input int InpMinSLPoints = 20;
+input int InpMaxSLPoints = 1500;
+
+// ===== SAFETY SETTINGS =====
+input bool InpUseTrendFilter = true;
+input bool InpAllowBuy = true;
+input bool InpAllowSell = true;
+
+int fastHandle = INVALID_HANDLE;
+int slowHandle = INVALID_HANDLE;
+datetime lastBarTime = 0;
+
+//--------------------------------------------------
+int OnInit()
+{
+   if(InpRiskPercent <= 0.0 ||
+      InpRiskPercent > 1.0 ||
+      InpRewardRisk < 1.0 ||
+      InpMaxTradesPerDay < 1 ||
+      InpSweepLookback < 2 ||
+      InpMaxSweepAge < 1 ||
+      InpMSSLookback < 2 ||
+      InpFastEMA < 1 ||
+      InpSlowEMA < 2 ||
+      InpSLBufferPoints < 0 ||
+      InpMinSLPoints < 1 ||
+      InpMaxSLPoints < InpMinSLPoints ||
+      InpMaxSpreadPoints < 0)
+   {
+      Print("Invalid EA input settings.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   fastHandle = iMA(_Symbol, InpTimeframe,
+                    InpFastEMA, 0, MODE_EMA, PRICE_CLOSE);
+
+   slowHandle = iMA(_Symbol, InpTimeframe,
+                    InpSlowEMA, 0, MODE_EMA, PRICE_CLOSE);
+
+   if(fastHandle == INVALID_HANDLE ||
+      slowHandle == INVALID_HANDLE)
+   {
+      Print("Failed to create EMA indicators.");
+      return INIT_FAILED;
+   }
+
+   trade.SetExpertMagicNumber(InpMagic);
+   trade.SetDeviationInPoints(InpDeviationPoints);
+   trade.SetTypeFillingBySymbol(_Symbol);
+   trade.SetAsyncMode(false);
+
+   Print("LS MSS Scalper initialized on ", _Symbol);
+   return INIT_SUCCEEDED;
+}
+
+//--------------------------------------------------
+void OnDeinit(const int reason)
+{
+   if(fastHandle != INVALID_HANDLE)
+      IndicatorRelease(fastHandle);
+
+   if(slowHandle != INVALID_HANDLE)
+      IndicatorRelease(slowHandle);
+}
+
+//--------------------------------------------------
+bool IsNewBar()
+{
+   datetime t = iTime(_Symbol, InpTimeframe, 0);
+
+   if(t == 0 || t == lastBarTime)
+      return false;
+
+   lastBarTime = t;
+   return true;
+}
+
+//--------------------------------------------------
+bool GetEMA(double &fast, double &slow)
+{
+   double f[1], s[1];
+
+   // Shift 1: last fully closed candle
+   if(CopyBuffer(fastHandle, 0, 1, 1, f) != 1)
+      return false;
+
+   if(CopyBuffer(slowHandle, 0, 1, 1, s) != 1)
+      return false;
+
+   fast = f[0];
+   slow = s[0];
+
+   return MathIsValidNumber(fast) &&
+          MathIsValidNumber(slow);
+}
+
+//--------------------------------------------------
+bool SpreadOK()
+{
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol, tick))
+      return false;
+
+   if(tick.ask <= 0 || tick.bid <= 0)
+      return false;
+
+   double spread = (tick.ask - tick.bid) / _Point;
+
+   return spread <= InpMaxSpreadPoints;
+}
+
+//--------------------------------------------------
+bool HasOpenPosition()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0)
+         continue;
+
+      // One EA position at a time, including other symbols
+      if((ulong)PositionGetInteger(POSITION_MAGIC) == InpMagic)
+         return true;
+   }
+
+   return false;
+}
+
+//--------------------------------------------------
+datetime ServerDayStart()
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+
+   dt.hour = 0;
+   dt.min  = 0;
+   dt.sec  = 0;
+
+   return StructToTime(dt);
+}
+
+//--------------------------------------------------
+int TradesToday()
+{
+   if(!HistorySelect(ServerDayStart(), TimeCurrent()))
+      return InpMaxTradesPerDay; // fail safe
+
+   int count = 0;
+
+   for(int i = 0; i < HistoryDealsTotal(); i++)
+   {
+      ulong deal = HistoryDealGetTicket(i);
+      if(deal == 0)
+         continue;
+
+      if((ulong)HistoryDealGetInteger(deal, DEAL_MAGIC) != InpMagic)
+         continue;
+
+      if(HistoryDealGetString(deal, DEAL_SYMBOL) != _Symbol)
+         continue;
+
+      ENUM_DEAL_ENTRY entry =
+         (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal, DEAL_ENTRY);
+
+      if(entry == DEAL_ENTRY_IN || entry == DEAL_ENTRY_INOUT)
+         count++;
+   }
+
+   return count;
+}
+
+//--------------------------------------------------
+double NormalizePrice(double price)
+{
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+
+   if(tickSize <= 0)
+      return NormalizeDouble(price, _Digits);
+
+   price = MathRound(price / tickSize) * tickSize;
+   return NormalizeDouble(price, _Digits);
+}
+
+//--------------------------------------------------
+double NormalizeVolumeDown(double volume)
+{
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double step   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   if(step <= 0 || minLot <= 0 || maxLot < minLot)
+      return 0.0;
+
+   if(volume < minLot)
+      return 0.0;
+
+   volume = MathMin(volume, maxLot);
+
+   // Floor volume so risk is not increased by rounding
+   double steps = MathFloor((volume - minLot) / step + 1e-9);
+   double lots  = minLot + steps * step;
+
+   if(lots < minLot - 1e-9)
+      return 0.0;
+
+   int digits = 0;
+   double tmp = step;
+
+   while(digits < 8 &&
+         MathAbs(tmp - MathRound(tmp)) > 1e-8)
+   {
+      tmp *= 10.0;
+      digits++;
+   }
+
+   return NormalizeDouble(lots, digits);
+}
+
+//--------------------------------------------------
+double CalculateLots(ENUM_ORDER_TYPE orderType,
+                     double entry, double sl)
+{
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double riskMoney = equity * InpRiskPercent / 100.0;
+
+   if(equity <= 0 || riskMoney <= 0)
+      return 0.0;
+
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+
+   double lossAtMinLot = 0.0;
+
+   ResetLastError();
+
+   if(!OrderCalcProfit(orderType, _Symbol, minLot,
+                       entry, sl, lossAtMinLot))
+   {
+      Print("OrderCalcProfit failed: ", GetLastError());
+      return 0.0;
+   }
+
+   lossAtMinLot = MathAbs(lossAtMinLot);
+
+   // Never force a trade when the broker's minimum lot
+   // exceeds the configured monetary risk.
+   if(lossAtMinLot <= 0 || lossAtMinLot > riskMoney)
+   {
+      Print("Trade skipped: minimum lot risks ",
+            DoubleToString(lossAtMinLot, 2),
+            ", allowed risk ",
+            DoubleToString(riskMoney, 2));
+      return 0.0;
+   }
+
+   // Estimate 1-lot loss using broker-specific contract data
+   double lossOneLot = 0.0;
+
+   if(!OrderCalcProfit(orderType, _Symbol, 1.0,
+                       entry, sl, lossOneLot))
+   {
+      Print("Cannot calculate one-lot risk.");
+      return 0.0;
+   }
+
+   lossOneLot = MathAbs(lossOneLot);
+
+   if(lossOneLot <= 0)
+      return 0.0;
+
+   double rawLots = riskMoney / lossOneLot;
+   double lots = NormalizeVolumeDown(rawLots);
+
+   if(lots <= 0)
+   {
+      Print("Trade skipped: calculated lot below minimum.");
+      return 0.0;
+   }
+
+   // Recalculate actual projected loss after volume rounding
+   double finalLoss = 0.0;
+
+   if(!OrderCalcProfit(orderType, _Symbol, lots,
+                       entry, sl, finalLoss))
+      return 0.0;
+
+   if(MathAbs(finalLoss) > riskMoney + 0.01)
+   {
+      Print("Trade skipped: rounded volume exceeds risk.");
+      return 0.0;
+   }
+
+   return lots;
+}
+
+//--------------------------------------------------
+bool StopDistanceOK(double entry, double sl)
+{
+   double distancePoints = MathAbs(entry - sl) / _Point;
+
+   if(distancePoints < InpMinSLPoints ||
+      distancePoints > InpMaxSLPoints)
+      return false;
+
+   long stopsLevel = SymbolInfoInteger(_Symbol,
+                                       SYMBOL_TRADE_STOPS_LEVEL);
+
+   if(distancePoints < (double)stopsLevel)
+      return false;
+
+   return true;
+}
+
+//--------------------------------------------------
+// Find a sweep candle followed by a confirmed MSS.
+// Rates are indexed: 0=current, 1=last closed candle.
+//--------------------------------------------------
+bool FindBuySignal(MqlRates &rates[],
+                   int total,
+                   double &sweepLow)
+{
+   int maxShift = MathMin(InpMaxSweepAge + 1, total - 2);
+
+   for(int sh = 2; sh <= maxShift; sh++)
+   {
+      int olderEnd = sh + InpSweepLookback;
+
+      if(olderEnd >= total)
+         continue;
+
+      double oldLow = rates[sh + 1].low;
+
+      for(int j = sh + 2; j <= olderEnd; j++)
+         oldLow = MathMin(oldLow, rates[j].low);
+
+      // Sweep below previous liquidity and close back above it
+      if(rates[sh].low >= oldLow ||
+         rates[sh].close <= oldLow)
+         continue;
+
+      // Structure level formed before the sweep candle
+      int mssEnd = sh + InpMSSLookback;
+
+      if(mssEnd >= total)
+         continue;
+
+      double structureHigh = rates[sh + 1].high;
+
+      for(int j = sh + 2; j <= mssEnd; j++)
+         structureHigh = MathMax(structureHigh, rates[j].high);
+
+      // Most recent closed candle confirms bullish MSS
+      if(rates[1].close > structureHigh)
+      {
+         sweepLow = rates[sh].low;
+         return true;
+      }
+   }
+
+   return false;
+}
+
+//--------------------------------------------------
+bool FindSellSignal(MqlRates &rates[],
+                    int total,
+                    double &sweepHigh)
+{
+   int maxShift = MathMin(InpMaxSweepAge + 1, total - 2);
+
+   for(int sh = 2; sh <= maxShift; sh++)
+   {
+      int olderEnd = sh + InpSweepLookback;
+
+      if(olderEnd >= total)
+         continue;
+
+      double oldHigh = rates[sh + 1].high;
+
+      for(int j = sh + 2; j <= olderEnd; j++)
+         oldHigh = MathMax(oldHigh, rates[j].high);
+
+      // Sweep above previous liquidity and close back below it
+      if(rates[sh].high <= oldHigh ||
+         rates[sh].close >= oldHigh)
+         continue;
+
+      int mssEnd = sh + InpMSSLookback;
+
+      if(mssEnd >= total)
+         continue;
+
+      double structureLow = rates[sh + 1].low;
+
+      for(int j = sh + 2; j <= mssEnd; j++)
+         structureLow = MathMin(structureLow, rates[j].low);
+
+      // Most recent closed candle confirms bearish MSS
+      if(rates[1].close < structureLow)
+      {
+         sweepHigh = rates[sh].high;
+         return true;
+      }
+   }
+
+   return false;
+}
+
+//--------------------------------------------------
+bool TradingAllowed()
+{
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) ||
+      !MQLInfoInteger(MQL_TRADE_ALLOWED) ||
+      !AccountInfoInteger(ACCOUNT_TRADE_ALLOWED))
+      return false;
+
+   if(!SpreadOK())
+      return false;
+
+   if(HasOpenPosition())
+      return false;
+
+   if(TradesToday() >= InpMaxTradesPerDay)
+      return false;
+
+   return true;
+}
+
+//--------------------------------------------------
+void OpenBuy(double sweepLow)
+{
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol, tick))
+      return;
+
+   double entry = tick.ask;
+   double sl = NormalizePrice(
+      sweepLow - InpSLBufferPoints * _Point
+   );
+
+   if(sl >= entry || !StopDistanceOK(entry, sl))
+      return;
+
+   double tp = NormalizePrice(
+      entry + (entry - sl) * InpRewardRisk
+   );
+
+   double lots = CalculateLots(ORDER_TYPE_BUY, entry, sl);
+
+   if(lots <= 0)
+      return;
+
+   bool ok = trade.Buy(lots, _Symbol, 0.0, sl, tp,
+                       "LS MSS BUY");
+
+   if(!ok)
+      Print("BUY failed: ", trade.ResultRetcode(),
+            " ", trade.ResultRetcodeDescription());
+}
+
+//--------------------------------------------------
+void OpenSell(double sweepHigh)
+{
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol, tick))
+      return;
+
+   double entry = tick.bid;
+   double sl = NormalizePrice(
+      sweepHigh + InpSLBufferPoints * _Point
+   );
+
+   if(sl <= entry || !StopDistanceOK(entry, sl))
+      return;
+
+   double tp = NormalizePrice(
+      entry - (sl - entry) * InpRewardRisk
+   );
+
+   double lots = CalculateLots(ORDER_TYPE_SELL, entry, sl);
+
+   if(lots <= 0)
+      return;
+
+   bool ok = trade.Sell(lots, _Symbol, 0.0, sl, tp,
+                        "LS MSS SELL");
+
+   if(!ok)
+      Print("SELL failed: ", trade.ResultRetcode(),
+            " ", trade.ResultRetcodeDescription());
+}
+
+//--------------------------------------------------
+void OnTick()
+{
+   if(!IsNewBar())
+      return;
+
+   if(!TradingAllowed())
+      return;
+
+   double fastEMA, slowEMA;
+
+   if(!GetEMA(fastEMA, slowEMA))
+      return;
+
+   int needed = InpSweepLookback +
+                InpMSSLookback +
+                InpMaxSweepAge + 5;
+
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+
+   int copied = CopyRates(_Symbol, InpTimeframe,
+                          0, needed, rates);
+
+   if(copied < needed)
+      return;
+
+   double sweepLow = 0.0;
+   double sweepHigh = 0.0;
+
+   bool buySignal = false;
+   bool sellSignal = false;
+
+   if(InpAllowBuy &&
+      (!InpUseTrendFilter || fastEMA > slowEMA))
+   {
+      buySignal = FindBuySignal(rates, copied, sweepLow);
+   }
+
+   if(InpAllowSell &&
+      (!InpUseTrendFilter || fastEMA < slowEMA))
+   {
+      sellSignal = FindSellSignal(rates, copied, sweepHigh);
+   }
+
+   // Never open both directions on the same bar
+   if(buySignal && !sellSignal)
+      OpenBuy(sweepLow);
+   else if(sellSignal && !buySignal)
+      OpenSell(sweepHigh);
+}
